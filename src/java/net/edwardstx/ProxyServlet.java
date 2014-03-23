@@ -9,46 +9,35 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 import java.util.Map;
+import java.util.logging.Logger;
 
 import javax.servlet.ServletConfig;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpSession;
 
-import org.apache.commons.fileupload.FileItem;
-import org.apache.commons.fileupload.FileUploadException;
-import org.apache.commons.fileupload.disk.DiskFileItemFactory;
-import org.apache.commons.fileupload.servlet.ServletFileUpload;
 import org.apache.commons.httpclient.Header;
 import org.apache.commons.httpclient.HttpClient;
 import org.apache.commons.httpclient.HttpMethod;
 import org.apache.commons.httpclient.NameValuePair;
 import org.apache.commons.httpclient.methods.GetMethod;
 import org.apache.commons.httpclient.methods.PostMethod;
-import org.apache.commons.httpclient.methods.multipart.ByteArrayPartSource;
-import org.apache.commons.httpclient.methods.multipart.FilePart;
-import org.apache.commons.httpclient.methods.multipart.MultipartRequestEntity;
-import org.apache.commons.httpclient.methods.multipart.Part;
-import org.apache.commons.httpclient.methods.multipart.StringPart;
 
-
+// modified to check for valid Shiro User on every GET and POST request
+// see member  SHIRO_LOGIN_SESSION_KEY
 public class ProxyServlet extends HttpServlet {
 	/**
 	 * Serialization UID.
 	 */
 	private static final long serialVersionUID = 1L;
-	
-	
-	/**
-	 * Logger (use java.util to avoid dependencies - or should we use log4j because of Grails?).
-	 */
-	private static Logger logger = Logger.getLogger(ProxyServlet.class.getName());
-	
-	/**
+    /**
+     * Logger (use java.util to avoid dependencies - or should we use log4j because of Grails?).
+     */
+    private static Logger logger = Logger.getLogger(ProxyServlet.class.getName());
+    /**
 	 * Key for redirect location header.
 	 */
     private static final String STRING_LOCATION_HEADER = "Location";
@@ -69,7 +58,11 @@ public class ProxyServlet extends HttpServlet {
      * The directory to use to temporarily store uploaded files
      */
     private static final File FILE_UPLOAD_TEMP_DIRECTORY = new File(System.getProperty("java.io.tmpdir"));
-    
+    /**
+     * How to tell if a User has already been logged in to Apache Shiro - this fork checks for it on each request
+     */
+    private static final String SHIRO_LOGIN_SESSION_KEY = "org.apache.shiro.subject.support.DefaultSubjectContext_AUTHENTICATED_SESSION_KEY";
+
     // Proxy host params
     /**
      * The scheme to which we are proxying requests "http://" or "https://"
@@ -87,6 +80,10 @@ public class ProxyServlet extends HttpServlet {
 	 * The (optional) path on the proxy host to wihch we are proxying requests. Default value is "".
 	 */
 	private String stringProxyPath = "";
+    /**
+     * Optional config variable where if set will redirect request to Login page (Apache Shiro specific)
+     */
+    private String loginUri;
 	/**
 	 * The maximum size for uploaded files in bytes. Default value is 5MB.
 	 */
@@ -97,8 +94,6 @@ public class ProxyServlet extends HttpServlet {
 	 * @param servletConfig The Servlet configuration passed in by the servlet conatiner
 	 */
 	public void init(ServletConfig servletConfig) {
-    	logger.setLevel(Level.OFF);
-    	logger.info("init");
 		// Get the proxy scheme (http:// or https://)
 		String stringProxySchemeNew = servletConfig.getInitParameter("proxyScheme");
 		if(stringProxySchemeNew == null || stringProxySchemeNew.length() == 0 ||
@@ -127,6 +122,11 @@ public class ProxyServlet extends HttpServlet {
 		if(stringMaxFileUploadSize != null && stringMaxFileUploadSize.length() > 0) {
 			this.setMaxFileUploadSize(Integer.parseInt(stringMaxFileUploadSize));
 		}
+        // Get login URI if specified
+        String stringLogin = servletConfig.getInitParameter("login");
+        if (stringLogin != null && stringLogin.trim().length() > 0) {
+            this.setLoginUri(stringLogin);
+        }
 	}
 	
 	/**
@@ -139,13 +139,19 @@ public class ProxyServlet extends HttpServlet {
 	 */
 	public void doGet (HttpServletRequest httpServletRequest, HttpServletResponse httpServletResponse)
     		throws IOException, ServletException {
-    	logger.info("doGet");
 		// Create a GET request
 		GetMethod getMethodProxyRequest = new GetMethod(this.getProxyURL(httpServletRequest));
 		// Forward the request headers
 		setProxyRequestHeaders(httpServletRequest, getMethodProxyRequest);
-    	// Execute the proxy request
-		this.executeProxyRequest(getMethodProxyRequest, httpServletRequest, httpServletResponse);
+
+        if (this.isAuthenticated(httpServletRequest)) {
+            // Execute the proxy request
+            this.executeProxyRequest(getMethodProxyRequest, httpServletRequest, httpServletResponse);
+        }
+        else {
+            String redirectPath = httpServletRequest.getContextPath() + this.getLoginUri() + httpServletRequest.getRequestURI().substring(httpServletRequest.getContextPath().length());
+            httpServletResponse.sendRedirect(redirectPath);
+        }
 	}
 	
 	/**
@@ -158,87 +164,47 @@ public class ProxyServlet extends HttpServlet {
 	 */
 	public void doPost(HttpServletRequest httpServletRequest, HttpServletResponse httpServletResponse)
         	throws IOException, ServletException {
-    	logger.info("doPost");
     	// Create a standard POST request
     	PostMethod postMethodProxyRequest = new PostMethod(this.getProxyURL(httpServletRequest));
 		// Forward the request headers
 		setProxyRequestHeaders(httpServletRequest, postMethodProxyRequest);
-    	// Check if this is a mulitpart (file upload) POST
-    	if(ServletFileUpload.isMultipartContent(httpServletRequest)) {
-    		this.handleMultipartPost(postMethodProxyRequest, httpServletRequest);
-    	} else {
-    		this.handleStandardPost(postMethodProxyRequest, httpServletRequest);
-    	}
-    	// Execute the proxy request
-    	this.executeProxyRequest(postMethodProxyRequest, httpServletRequest, httpServletResponse);
+
+        if (this.isAuthenticated(httpServletRequest)) {
+            this.handleStandardPost(postMethodProxyRequest, httpServletRequest);
+            // Execute the proxy request
+            this.executeProxyRequest(postMethodProxyRequest, httpServletRequest, httpServletResponse);
+        }
     }
-	
-	/**
-	 * Sets up the given {@link PostMethod} to send the same multipart POST
-	 * data as was sent in the given {@link HttpServletRequest}
-	 * @param postMethodProxyRequest The {@link PostMethod} that we are
-	 *                                configuring to send a multipart POST request
-	 * @param httpServletRequest The {@link HttpServletRequest} that contains
-	 *                            the mutlipart POST data to be sent via the {@link PostMethod}
-	 */
-    @SuppressWarnings("unchecked")
-	private void handleMultipartPost(PostMethod postMethodProxyRequest, HttpServletRequest httpServletRequest)
-    		throws ServletException {
-    	// Create a factory for disk-based file items
-    	DiskFileItemFactory diskFileItemFactory = new DiskFileItemFactory();
-    	// Set factory constraints
-    	diskFileItemFactory.setSizeThreshold(this.getMaxFileUploadSize());
-    	diskFileItemFactory.setRepository(FILE_UPLOAD_TEMP_DIRECTORY);
-    	// Create a new file upload handler
-    	ServletFileUpload servletFileUpload = new ServletFileUpload(diskFileItemFactory);
-    	// Parse the request
-    	try {
-    		// Get the multipart items as a list
-    		List<FileItem> listFileItems = (List<FileItem>) servletFileUpload.parseRequest(httpServletRequest);
-    		// Create a list to hold all of the parts
-    		List<Part> listParts = new ArrayList<Part>();
-    		// Iterate the multipart items list
-    		for(FileItem fileItemCurrent : listFileItems) {
-    			// If the current item is a form field, then create a string part
-    			if (fileItemCurrent.isFormField()) {
-    				StringPart stringPart = new StringPart(
-    						fileItemCurrent.getFieldName(), // The field name
-    						fileItemCurrent.getString()     // The field value
-    				);
-    				// Add the part to the list
-    				listParts.add(stringPart);
-    			} else {
-    				// The item is a file upload, so we create a FilePart
-    				FilePart filePart = new FilePart(
-    						fileItemCurrent.getFieldName(),    // The field name
-    						new ByteArrayPartSource(
-    								fileItemCurrent.getName(), // The uploaded file name
-    								fileItemCurrent.get()      // The uploaded file contents
-    						)
-    				);
-    				// Add the part to the list
-    				listParts.add(filePart);
-    			}
-    		}
-    		MultipartRequestEntity multipartRequestEntity = new MultipartRequestEntity(
-																listParts.toArray(new Part[] {}),
-																postMethodProxyRequest.getParams()
-															);
-    		postMethodProxyRequest.setRequestEntity(multipartRequestEntity);
-    		// The current content-type header (received from the client) IS of
-    		// type "multipart/form-data", but the content-type header also
-    		// contains the chunk boundary string of the chunks. Currently, this
-    		// header is using the boundary of the client request, since we
-    		// blindly copied all headers from the client request to the proxy
-    		// request. However, we are creating a new request with a new chunk
-    		// boundary string, so it is necessary that we re-set the
-    		// content-type string to reflect the new chunk boundary string
-    		postMethodProxyRequest.setRequestHeader(STRING_CONTENT_TYPE_HEADER_NAME, multipartRequestEntity.getContentType());
-    	} catch (FileUploadException fileUploadException) {
-    		throw new ServletException(fileUploadException);
-    	}
+
+
+    /**
+     * Check Session for a known Shiro session variable - if true then the User Principal should be set as well
+     *
+     * @param httpServletRequest The {@link HttpServletRequest} object passed
+     *                            in by the servlet engine representing the
+     *                            client request to be proxied
+     * @return true if logged in to Shiro
+     */
+    private boolean isAuthenticated(HttpServletRequest httpServletRequest) {
+        try {
+            HttpSession session = httpServletRequest.getSession(false);
+            if (null == session) {
+                return false;
+            }
+
+            Object sessionFlag = session.getAttribute(SHIRO_LOGIN_SESSION_KEY);
+            if (null != sessionFlag && sessionFlag.equals(Boolean.TRUE)) {
+                return true;
+            }
+            else {
+                return false;
+            }
+        }
+        catch (Exception ex) {
+            return false;
+        }
     }
-    
+
 	/**
 	 * Sets up the given {@link PostMethod} to send the same standard POST
 	 * data as was sent in the given {@link HttpServletRequest}
@@ -368,18 +334,13 @@ public class ProxyServlet extends HttpServlet {
 			Enumeration enumerationOfHeaderValues = httpServletRequest.getHeaders(stringHeaderName);
 			while(enumerationOfHeaderValues.hasMoreElements()) {
 				String stringHeaderValue = (String) enumerationOfHeaderValues.nextElement();
-			    logger.info("<== Received request header   " + stringHeaderName + " ==: " + stringHeaderValue);
 				// In case the proxy host is running multiple virtual servers,
 				// rewrite the Host header to ensure that we get content from
 				// the correct virtual server
 				if(stringHeaderName.equalsIgnoreCase(STRING_HOST_HEADER_NAME)){
 					stringHeaderValue = getProxyHostAndPort();
 				}
-				if(stringHeaderName.equalsIgnoreCase("X-Forward-HTTP-Method-Override")) {
-				    stringHeaderName = "X-HTTP-Method-Override";
-				}
 				Header header = new Header(stringHeaderName, stringHeaderValue);
-		    	logger.info("==> Forwarding request header " + stringHeaderName + " ==: " + stringHeaderValue);
 				// Set the same header on the proxy request
 				httpMethodProxyRequest.setRequestHeader(header);
 			}
@@ -438,7 +399,13 @@ public class ProxyServlet extends HttpServlet {
 	private int getMaxFileUploadSize() {
 		return this.intMaxFileUploadSize;
 	}
-	private void setMaxFileUploadSize(int intMaxFileUploadSizeNew) {
+    private void setMaxFileUploadSize(int intMaxFileUploadSizeNew) {
 		this.intMaxFileUploadSize = intMaxFileUploadSizeNew;
 	}
+    public String getLoginUri() {
+        return loginUri;
+    }
+    public void setLoginUri(String loginUri) {
+        this.loginUri = loginUri;
+    }
 }
